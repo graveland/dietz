@@ -225,17 +225,18 @@ pub fn Tree(comptime T: type) type {
 
         const NodePool = std.heap.MemoryPool(Node);
 
-        pool: NodePool,
+        allocator: std.mem.Allocator,
+        pool: NodePool = .empty,
         root: ?*Node = null,
         node_count: usize = 0,
 
         /// Initialize an empty tree
         pub fn init(allocator: std.mem.Allocator) Self {
-            return .{ .pool = NodePool.init(allocator) };
+            return .{ .allocator = allocator };
         }
 
         fn allocNode(self: *Self) !*Node {
-            return self.pool.create();
+            return self.pool.create(self.allocator);
         }
 
         fn freeNode(self: *Self, node: *Node) void {
@@ -244,7 +245,7 @@ pub fn Tree(comptime T: type) type {
 
         /// Free all nodes and the underlying memory pool
         pub fn deinit(self: *Self) void {
-            self.pool.deinit();
+            self.pool.deinit(self.allocator);
             self.root = null;
             self.node_count = 0;
         }
