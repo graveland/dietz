@@ -126,58 +126,127 @@ pub fn Tree(comptime T: type) type {
             interval: IntervalType,
             left: ?*Node = null,
             right: ?*Node = null,
+            height: i32 = 1,
         };
 
-        allocator: std.mem.Allocator,
+        // AVL helper functions
+        fn nodeHeight(node: ?*Node) i32 {
+            return if (node) |n| n.height else 0;
+        }
+
+        fn updateHeight(node: *Node) void {
+            node.height = 1 + @max(nodeHeight(node.left), nodeHeight(node.right));
+        }
+
+        fn balanceFactor(node: *Node) i32 {
+            return nodeHeight(node.left) - nodeHeight(node.right);
+        }
+
+        fn rotateRight(self: *Self, y: *Node) *Node {
+            _ = self;
+            const x = y.left.?;
+            const t2 = x.right;
+
+            x.right = y;
+            y.left = t2;
+
+            updateHeight(y);
+            updateHeight(x);
+
+            return x;
+        }
+
+        fn rotateLeft(self: *Self, x: *Node) *Node {
+            _ = self;
+            const y = x.right.?;
+            const t2 = y.left;
+
+            y.left = x;
+            x.right = t2;
+
+            updateHeight(x);
+            updateHeight(y);
+
+            return y;
+        }
+
+        fn rebalance(self: *Self, node: *Node) *Node {
+            updateHeight(node);
+            const balance = balanceFactor(node);
+
+            // Left heavy
+            if (balance > 1) {
+                if (balanceFactor(node.left.?) < 0) {
+                    // Left-Right case
+                    node.left = self.rotateLeft(node.left.?);
+                }
+                // Left-Left case
+                return self.rotateRight(node);
+            }
+
+            // Right heavy
+            if (balance < -1) {
+                if (balanceFactor(node.right.?) > 0) {
+                    // Right-Left case
+                    node.right = self.rotateRight(node.right.?);
+                }
+                // Right-Right case
+                return self.rotateLeft(node);
+            }
+
+            return node;
+        }
+
+        fn debugValidateTree(self: *Self, node: ?*Node) void {
+            const n = node orelse return;
+
+            // Validate height is correct
+            const left_h = nodeHeight(n.left);
+            const right_h = nodeHeight(n.right);
+            const expected_h = 1 + @max(left_h, right_h);
+            std.debug.assert(n.height == expected_h);
+
+            // Validate AVL property
+            const balance = left_h - right_h;
+            std.debug.assert(balance >= -1 and balance <= 1);
+
+            // Validate BST property (intervals are ordered)
+            if (n.left) |left| {
+                std.debug.assert(left.interval.last < n.interval.first);
+            }
+            if (n.right) |right| {
+                std.debug.assert(n.interval.last < right.interval.first);
+            }
+
+            // Recurse
+            self.debugValidateTree(n.left);
+            self.debugValidateTree(n.right);
+        }
+
+        const NodePool = std.heap.MemoryPool(Node);
+
+        pool: NodePool,
         root: ?*Node = null,
         node_count: usize = 0,
 
         /// Initialize an empty tree
         pub fn init(allocator: std.mem.Allocator) Self {
-            return .{ .allocator = allocator };
+            return .{ .pool = NodePool.init(allocator) };
         }
 
-        /// Free all nodes in the tree (iterative to avoid stack overflow)
+        fn allocNode(self: *Self) !*Node {
+            return self.pool.create();
+        }
+
+        fn freeNode(self: *Self, node: *Node) void {
+            self.pool.destroy(node);
+        }
+
+        /// Free all nodes and the underlying memory pool
         pub fn deinit(self: *Self) void {
-            // Use iterative post-order traversal with explicit stack
-            var stack: std.ArrayList(*Node) = .empty;
-            defer stack.deinit(self.allocator);
-
-            var current = self.root;
-            var last_visited: ?*Node = null;
-
-            while (current != null or stack.items.len > 0) {
-                if (current) |node| {
-                    stack.append(self.allocator, node) catch {
-                        // If we can't allocate stack space, fall back to recursive
-                        self.freeNodeRecursive(self.root);
-                        self.root = null;
-                        self.node_count = 0;
-                        return;
-                    };
-                    current = node.left;
-                } else {
-                    const peek_node = stack.items[stack.items.len - 1];
-                    if (peek_node.right != null and last_visited != peek_node.right) {
-                        current = peek_node.right;
-                    } else {
-                        _ = stack.pop();
-                        last_visited = peek_node;
-                        self.allocator.destroy(peek_node);
-                    }
-                }
-            }
-
+            self.pool.deinit();
             self.root = null;
             self.node_count = 0;
-        }
-
-        fn freeNodeRecursive(self: *Self, node: ?*Node) void {
-            if (node) |n| {
-                self.freeNodeRecursive(n.left);
-                self.freeNodeRecursive(n.right);
-                self.allocator.destroy(n);
-            }
         }
 
         /// Returns true if the tree contains no elements
@@ -256,21 +325,93 @@ pub fn Tree(comptime T: type) type {
         }
 
         /// Insert a range of elements [first, last] into the tree
+        /// This is O(log n + k) where k is the number of affected intervals
         pub fn insertRange(self: *Self, first: T, last: T) !void {
             std.debug.assert(first <= last);
-            // Insert each element - the merging will combine them
-            // This is not optimal but correct; a more efficient implementation
-            // would insert the range as a single interval and merge
-            var elem = first;
-            while (elem <= last) : (elem += 1) {
-                try self.insert(elem);
-                if (elem == last) break; // Prevent overflow
+            self.root = try self.insertRangeInto(self.root, first, last);
+        }
+
+        fn insertRangeInto(self: *Self, node: ?*Node, first: T, last: T) !?*Node {
+            const n = node orelse {
+                const new_node = try self.allocNode();
+                new_node.* = .{ .interval = IntervalType.initRange(first, last) };
+                self.node_count += 1;
+                return new_node;
+            };
+
+            // Check if range is entirely contained
+            if (n.interval.hasRange(first, last)) {
+                return n;
             }
+
+            // Check for overlap or adjacency with current interval
+            const overlaps = n.interval.intersectsRange(first, last);
+            // Adjacent-left: range ends just before interval starts (last + 1 == interval.first)
+            const adjacent_left = last != std.math.maxInt(T) and last + 1 == n.interval.first;
+            // Adjacent-right: interval ends just before range starts (interval.last + 1 == first)
+            const adjacent_right = n.interval.last != std.math.maxInt(T) and n.interval.last + 1 == first;
+
+            if (overlaps or adjacent_left or adjacent_right) {
+                // Extend the current interval to encompass the range
+                n.interval.first = @min(n.interval.first, first);
+                n.interval.last = @max(n.interval.last, last);
+
+                // Now we need to absorb any overlapping/adjacent intervals from children
+                n.left = self.absorbOverlapping(n.left, n);
+                n.right = self.absorbOverlapping(n.right, n);
+
+                return self.rebalance(n);
+            } else if (last < n.interval.first) {
+                n.left = try self.insertRangeInto(n.left, first, last);
+                return self.rebalance(n);
+            } else {
+                n.right = try self.insertRangeInto(n.right, first, last);
+                return self.rebalance(n);
+            }
+        }
+
+        fn absorbOverlapping(self: *Self, node: ?*Node, target: *Node) ?*Node {
+            const n = node orelse return null;
+
+            // Check if this node's interval overlaps or is adjacent to target
+            const overlaps = target.interval.intersectsRange(n.interval.first, n.interval.last);
+            const adjacent = target.interval.adjacent(n.interval);
+
+            if (overlaps or adjacent) {
+                // Merge this interval into target
+                target.interval.first = @min(target.interval.first, n.interval.first);
+                target.interval.last = @max(target.interval.last, n.interval.last);
+
+                // Recursively check children before destroying this node
+                const new_left = self.absorbOverlapping(n.left, target);
+                const new_right = self.absorbOverlapping(n.right, target);
+
+                // Merge the children
+                const merged = self.mergeSubtrees(new_left, new_right);
+
+                self.freeNode(n);
+                self.node_count -= 1;
+
+                // Continue absorbing from merged subtree
+                return self.absorbOverlapping(merged, target);
+            } else if (target.interval.last < n.interval.first) {
+                // Target is entirely left of this node, check left subtree
+                n.left = self.absorbOverlapping(n.left, target);
+                return self.rebalance(n);
+            } else {
+                // Target is entirely right of this node, check right subtree
+                n.right = self.absorbOverlapping(n.right, target);
+                return self.rebalance(n);
+            }
+        }
+
+        fn mergeSubtrees(self: *Self, left: ?*Node, right: ?*Node) ?*Node {
+            return self.mergeChildrenBalanced(left, right);
         }
 
         fn insertInto(self: *Self, node: ?*Node, elem: T) !?*Node {
             const n = node orelse {
-                const new_node = try self.allocator.create(Node);
+                const new_node = try self.allocNode();
                 new_node.* = .{ .interval = IntervalType.init(elem) };
                 self.node_count += 1;
                 return new_node;
@@ -280,18 +421,16 @@ pub fn Tree(comptime T: type) type {
                 return n;
             } else if (n.interval.adjacentLeft(elem)) {
                 n.interval.first = elem;
-                self.joinLeft(n);
-                return n;
+                return self.joinLeft(n);
             } else if (n.interval.adjacentRight(elem)) {
                 n.interval.last = elem;
-                self.joinRight(n);
-                return n;
+                return self.joinRight(n);
             } else if (elem < n.interval.first) {
                 n.left = try self.insertInto(n.left, elem);
-                return n;
+                return self.rebalance(n);
             } else {
                 n.right = try self.insertInto(n.right, elem);
-                return n;
+                return self.rebalance(n);
             }
         }
 
@@ -301,12 +440,62 @@ pub fn Tree(comptime T: type) type {
         }
 
         /// Delete a range of elements [first, last] from the tree
+        /// This is O(log n + k) where k is the number of affected intervals
         pub fn deleteRange(self: *Self, first: T, last: T) void {
             std.debug.assert(first <= last);
-            var elem = first;
-            while (elem <= last) : (elem += 1) {
-                self.delete(elem);
-                if (elem == last) break;
+            self.root = self.deleteRangeFrom(self.root, first, last);
+        }
+
+        fn deleteRangeFrom(self: *Self, node: ?*Node, first: T, last: T) ?*Node {
+            const n = node orelse return null;
+
+            // If range is entirely to the left, recurse left
+            if (last < n.interval.first) {
+                n.left = self.deleteRangeFrom(n.left, first, last);
+                return self.rebalance(n);
+            }
+
+            // If range is entirely to the right, recurse right
+            if (first > n.interval.last) {
+                n.right = self.deleteRangeFrom(n.right, first, last);
+                return self.rebalance(n);
+            }
+
+            // Range overlaps with this interval
+            // First, handle any portion of the delete range in children
+            if (first < n.interval.first) {
+                n.left = self.deleteRangeFrom(n.left, first, n.interval.first - 1);
+            }
+            if (last > n.interval.last) {
+                n.right = self.deleteRangeFrom(n.right, n.interval.last + 1, last);
+            }
+
+            // Now handle overlap with this node's interval
+            if (first <= n.interval.first and last >= n.interval.last) {
+                // Entire interval is deleted - remove this node
+                const result = self.mergeSubtrees(n.left, n.right);
+                self.freeNode(n);
+                self.node_count -= 1;
+                return result;
+            } else if (first <= n.interval.first) {
+                // Trim from left: delete [interval.first, last], keep [last+1, interval.last]
+                n.interval.first = last + 1;
+                return self.rebalance(n);
+            } else if (last >= n.interval.last) {
+                // Trim from right: delete [first, interval.last], keep [interval.first, first-1]
+                n.interval.last = first - 1;
+                return self.rebalance(n);
+            } else {
+                // Split: keep [interval.first, first-1] and [last+1, interval.last]
+                const right_interval = IntervalType.initRange(last + 1, n.interval.last);
+                n.interval.last = first - 1;
+
+                // Insert the right portion into the right subtree
+                const new_node = self.allocNode() catch return n;
+                new_node.* = .{ .interval = right_interval, .left = null, .right = n.right };
+                n.right = new_node;
+                self.node_count += 1;
+                return self.rebalance(n);
             }
         }
 
@@ -315,16 +504,16 @@ pub fn Tree(comptime T: type) type {
 
             if (elem < n.interval.first) {
                 n.left = self.deleteFrom(n.left, elem);
-                return n;
+                return self.rebalance(n);
             } else if (elem > n.interval.last) {
                 n.right = self.deleteFrom(n.right, elem);
-                return n;
+                return self.rebalance(n);
             } else {
                 // Element is within this interval
                 if (n.interval.first == n.interval.last) {
                     // Single element interval - remove the node
-                    const result = self.mergeChildren(n.left, n.right);
-                    self.allocator.destroy(n);
+                    const result = self.mergeChildrenBalanced(n.left, n.right);
+                    self.freeNode(n);
                     self.node_count -= 1;
                     return result;
                 } else if (elem == n.interval.first) {
@@ -342,7 +531,7 @@ pub fn Tree(comptime T: type) type {
                     const new_interval = IntervalType.initRange(elem + 1, n.interval.last);
                     n.interval.last = elem - 1;
 
-                    const new_node = self.allocator.create(Node) catch {
+                    const new_node = self.allocNode() catch {
                         // If allocation fails, we've already modified the interval
                         // This leaves the tree in an inconsistent state - restore
                         n.interval.last = elem - 1; // Already set
@@ -351,9 +540,61 @@ pub fn Tree(comptime T: type) type {
                     new_node.* = .{ .interval = new_interval, .left = null, .right = n.right };
                     n.right = new_node;
                     self.node_count += 1;
-                    return n;
+                    return self.rebalance(n);
                 }
             }
+        }
+
+        /// Merge two subtrees, maintaining AVL balance
+        fn mergeChildrenBalanced(self: *Self, left: ?*Node, right: ?*Node) ?*Node {
+            if (left == null) return right;
+            if (right == null) return left;
+
+            // Extract the rightmost node of left subtree to use as new root
+            const result = self.extractRightmost(left.?);
+            const new_root = result.extracted;
+            const new_left = result.remaining;
+
+            new_root.left = new_left;
+            new_root.right = right;
+            return self.rebalance(new_root);
+        }
+
+        const ExtractResult = struct {
+            extracted: *Node,
+            remaining: ?*Node,
+        };
+
+        fn extractRightmost(self: *Self, node: *Node) ExtractResult {
+            if (node.right == null) {
+                // This is the rightmost node - extract it
+                return .{
+                    .extracted = node,
+                    .remaining = node.left,
+                };
+            }
+            const result = self.extractRightmost(node.right.?);
+            node.right = result.remaining;
+            return .{
+                .extracted = result.extracted,
+                .remaining = self.rebalance(node),
+            };
+        }
+
+        fn extractLeftmost(self: *Self, node: *Node) ExtractResult {
+            if (node.left == null) {
+                // This is the leftmost node - extract it
+                return .{
+                    .extracted = node,
+                    .remaining = node.right,
+                };
+            }
+            const result = self.extractLeftmost(node.left.?);
+            node.left = result.remaining;
+            return .{
+                .extracted = result.extracted,
+                .remaining = self.rebalance(node),
+            };
         }
 
         fn mergeChildren(self: *Self, left: ?*Node, right: ?*Node) ?*Node {
@@ -370,54 +611,82 @@ pub fn Tree(comptime T: type) type {
             return left;
         }
 
-        fn joinLeft(self: *Self, node: *Node) void {
-            if (node.left == null) return;
+        /// Try to merge with the rightmost node in the left subtree if adjacent
+        fn joinLeft(self: *Self, node: *Node) *Node {
+            if (node.left == null) return self.rebalance(node);
 
-            var parent: ?*Node = null;
-            var current = node.left.?;
-            while (current.right) |right| {
-                parent = current;
-                current = right;
-            }
+            // Find the rightmost node in left subtree
+            const rightmost = self.findRightmost(node.left.?);
 
-            if (current.interval.last != std.math.maxInt(T) and
-                current.interval.last + 1 == node.interval.first)
+            if (rightmost.interval.last != std.math.maxInt(T) and
+                rightmost.interval.last + 1 == node.interval.first)
             {
-                node.interval.first = current.interval.first;
-
-                if (parent) |p| {
-                    p.right = current.left;
-                } else {
-                    node.left = current.left;
-                }
-                self.allocator.destroy(current);
-                self.node_count -= 1;
+                // Merge: extend node's interval and remove the rightmost
+                node.interval.first = rightmost.interval.first;
+                node.left = self.removeRightmost(node.left.?);
             }
+
+            return self.rebalance(node);
         }
 
-        fn joinRight(self: *Self, node: *Node) void {
-            if (node.right == null) return;
+        /// Try to merge with the leftmost node in the right subtree if adjacent
+        fn joinRight(self: *Self, node: *Node) *Node {
+            if (node.right == null) return self.rebalance(node);
 
-            var parent: ?*Node = null;
-            var current = node.right.?;
-            while (current.left) |left| {
-                parent = current;
-                current = left;
-            }
+            // Find the leftmost node in right subtree
+            const leftmost = self.findLeftmost(node.right.?);
 
             if (node.interval.last != std.math.maxInt(T) and
-                node.interval.last + 1 == current.interval.first)
+                node.interval.last + 1 == leftmost.interval.first)
             {
-                node.interval.last = current.interval.last;
-
-                if (parent) |p| {
-                    p.left = current.right;
-                } else {
-                    node.right = current.right;
-                }
-                self.allocator.destroy(current);
-                self.node_count -= 1;
+                // Merge: extend node's interval and remove the leftmost
+                node.interval.last = leftmost.interval.last;
+                node.right = self.removeLeftmost(node.right.?);
             }
+
+            return self.rebalance(node);
+        }
+
+        fn findRightmost(self: *Self, node: *Node) *Node {
+            _ = self;
+            var current = node;
+            while (current.right) |right| {
+                current = right;
+            }
+            return current;
+        }
+
+        fn findLeftmost(self: *Self, node: *Node) *Node {
+            _ = self;
+            var current = node;
+            while (current.left) |left| {
+                current = left;
+            }
+            return current;
+        }
+
+        fn removeRightmost(self: *Self, node: *Node) ?*Node {
+            if (node.right == null) {
+                // This is the rightmost node
+                const left = node.left;
+                self.freeNode(node);
+                self.node_count -= 1;
+                return left;
+            }
+            node.right = self.removeRightmost(node.right.?);
+            return self.rebalance(node);
+        }
+
+        fn removeLeftmost(self: *Self, node: *Node) ?*Node {
+            if (node.left == null) {
+                // This is the leftmost node
+                const right = node.right;
+                self.freeNode(node);
+                self.node_count -= 1;
+                return right;
+            }
+            node.left = self.removeLeftmost(node.left.?);
+            return self.rebalance(node);
         }
 
         /// Get all intervals in the tree (in order)
@@ -434,6 +703,7 @@ pub fn Tree(comptime T: type) type {
         }
 
         /// Iterator for traversing intervals without allocation
+        /// Note: Limited to trees of depth <= 64. Debug builds will assert on overflow.
         pub const Iterator = struct {
             stack: [64]StackEntry = undefined,
             stack_len: usize = 0,
@@ -450,10 +720,9 @@ pub fn Tree(comptime T: type) type {
                     if (!top.visited_left) {
                         top.visited_left = true;
                         if (top.node.left) |left| {
-                            if (self.stack_len < self.stack.len) {
-                                self.stack[self.stack_len] = .{ .node = left, .visited_left = false };
-                                self.stack_len += 1;
-                            }
+                            std.debug.assert(self.stack_len < self.stack.len); // Tree too deep for iterator
+                            self.stack[self.stack_len] = .{ .node = left, .visited_left = false };
+                            self.stack_len += 1;
                         }
                         continue;
                     }
@@ -463,10 +732,9 @@ pub fn Tree(comptime T: type) type {
                     self.stack_len -= 1;
 
                     if (right) |r| {
-                        if (self.stack_len < self.stack.len) {
-                            self.stack[self.stack_len] = .{ .node = r, .visited_left = false };
-                            self.stack_len += 1;
-                        }
+                        std.debug.assert(self.stack_len < self.stack.len); // Tree too deep for iterator
+                        self.stack[self.stack_len] = .{ .node = r, .visited_left = false };
+                        self.stack_len += 1;
                     }
 
                     return interval;
@@ -488,26 +756,21 @@ pub fn Tree(comptime T: type) type {
 
         /// Create a new tree that is the union of this tree and another
         /// Caller owns the returned tree
+        /// This is O(k log n) where k is total number of intervals
         pub fn setUnion(self: *const Self, other: *const Self, allocator: std.mem.Allocator) !Self {
             var result = Self.init(allocator);
             errdefer result.deinit();
 
+            // Insert all intervals from self
             var it = self.iterator();
             while (it.next()) |interval| {
-                var elem = interval.first;
-                while (elem <= interval.last) : (elem += 1) {
-                    try result.insert(elem);
-                    if (elem == interval.last) break;
-                }
+                try result.insertRange(interval.first, interval.last);
             }
 
+            // Insert all intervals from other (merging happens automatically)
             var other_it = other.iterator();
             while (other_it.next()) |interval| {
-                var elem = interval.first;
-                while (elem <= interval.last) : (elem += 1) {
-                    try result.insert(elem);
-                    if (elem == interval.last) break;
-                }
+                try result.insertRange(interval.first, interval.last);
             }
 
             return result;
@@ -515,18 +778,23 @@ pub fn Tree(comptime T: type) type {
 
         /// Create a new tree that is the intersection of this tree and another
         /// Caller owns the returned tree
+        /// This is O(k * m) where k and m are interval counts
         pub fn setIntersection(self: *const Self, other: *const Self, allocator: std.mem.Allocator) !Self {
             var result = Self.init(allocator);
             errdefer result.deinit();
 
+            // For each interval in self, find overlapping portions with intervals in other
             var it = self.iterator();
             while (it.next()) |interval| {
-                var elem = interval.first;
-                while (elem <= interval.last) : (elem += 1) {
-                    if (other.contains(elem)) {
-                        try result.insert(elem);
+                var other_it = other.iterator();
+                while (other_it.next()) |other_interval| {
+                    // Check for overlap
+                    if (interval.intersectsRange(other_interval.first, other_interval.last)) {
+                        // Compute the intersection
+                        const start = @max(interval.first, other_interval.first);
+                        const end = @min(interval.last, other_interval.last);
+                        try result.insertRange(start, end);
                     }
-                    if (elem == interval.last) break;
                 }
             }
 
@@ -535,19 +803,21 @@ pub fn Tree(comptime T: type) type {
 
         /// Create a new tree that is this tree minus the other tree (difference)
         /// Caller owns the returned tree
+        /// This is O(k + m) where k and m are interval counts
         pub fn setDifference(self: *const Self, other: *const Self, allocator: std.mem.Allocator) !Self {
             var result = Self.init(allocator);
             errdefer result.deinit();
 
+            // First, copy all intervals from self
             var it = self.iterator();
             while (it.next()) |interval| {
-                var elem = interval.first;
-                while (elem <= interval.last) : (elem += 1) {
-                    if (!other.contains(elem)) {
-                        try result.insert(elem);
-                    }
-                    if (elem == interval.last) break;
-                }
+                try result.insertRange(interval.first, interval.last);
+            }
+
+            // Then delete all intervals from other
+            var other_it = other.iterator();
+            while (other_it.next()) |interval| {
+                result.deleteRange(interval.first, interval.last);
             }
 
             return result;
