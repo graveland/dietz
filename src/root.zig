@@ -104,8 +104,13 @@ pub fn Interval(comptime T: type) type {
         }
 
         /// Returns the number of elements in this interval
+        /// Uses wider arithmetic to avoid overflow with signed types
         pub fn count(self: Self) usize {
-            return @as(usize, @intCast(self.last - self.first)) + 1;
+            // Cast to wider signed type to avoid overflow when last - first
+            // exceeds the range of T (e.g., i8: 127 - (-128) = 255 overflows i8)
+            const first_wide: i128 = self.first;
+            const last_wide: i128 = self.last;
+            return @intCast(last_wide - first_wide + 1);
         }
     };
 }
@@ -464,10 +469,11 @@ pub fn Tree(comptime T: type) type {
 
             // Range overlaps with this interval
             // First, handle any portion of the delete range in children
-            if (first < n.interval.first) {
+            // Guard against underflow/overflow at type boundaries
+            if (first < n.interval.first and n.interval.first != std.math.minInt(T)) {
                 n.left = self.deleteRangeFrom(n.left, first, n.interval.first - 1);
             }
-            if (last > n.interval.last) {
+            if (last > n.interval.last and n.interval.last != std.math.maxInt(T)) {
                 n.right = self.deleteRangeFrom(n.right, n.interval.last + 1, last);
             }
 
@@ -488,11 +494,16 @@ pub fn Tree(comptime T: type) type {
                 return self.rebalance(n);
             } else {
                 // Split: keep [interval.first, first-1] and [last+1, interval.last]
-                const right_interval = IntervalType.initRange(last + 1, n.interval.last);
+                const original_last = n.interval.last;
+                const right_interval = IntervalType.initRange(last + 1, original_last);
                 n.interval.last = first - 1;
 
                 // Insert the right portion into the right subtree
-                const new_node = self.allocNode() catch return n;
+                const new_node = self.allocNode() catch {
+                    // Restore the original interval on allocation failure
+                    n.interval.last = original_last;
+                    return n;
+                };
                 new_node.* = .{ .interval = right_interval, .left = null, .right = n.right };
                 n.right = new_node;
                 self.node_count += 1;
@@ -529,14 +540,14 @@ pub fn Tree(comptime T: type) type {
                     // Split the interval: [first, elem-1] and [elem+1, last]
                     // Current node keeps [first, elem-1]
                     // Create new node for [elem+1, last] and insert into right subtree
-                    const new_interval = IntervalType.initRange(elem + 1, n.interval.last);
+                    const original_last = n.interval.last;
+                    const new_interval = IntervalType.initRange(elem + 1, original_last);
                     n.interval.last = elem - 1;
 
                     const new_node = self.allocNode() catch {
-                        // If allocation fails, we've already modified the interval
-                        // This leaves the tree in an inconsistent state - restore
-                        n.interval.last = elem - 1; // Already set
-                        return n; // Best effort
+                        // Restore the original interval on allocation failure
+                        n.interval.last = original_last;
+                        return n;
                     };
                     new_node.* = .{ .interval = new_interval, .left = null, .right = n.right };
                     n.right = new_node;
@@ -580,36 +591,6 @@ pub fn Tree(comptime T: type) type {
                 .extracted = result.extracted,
                 .remaining = self.rebalance(node),
             };
-        }
-
-        fn extractLeftmost(self: *Self, node: *Node) ExtractResult {
-            if (node.left == null) {
-                // This is the leftmost node - extract it
-                return .{
-                    .extracted = node,
-                    .remaining = node.right,
-                };
-            }
-            const result = self.extractLeftmost(node.left.?);
-            node.left = result.remaining;
-            return .{
-                .extracted = result.extracted,
-                .remaining = self.rebalance(node),
-            };
-        }
-
-        fn mergeChildren(self: *Self, left: ?*Node, right: ?*Node) ?*Node {
-            _ = self;
-            if (left == null) return right;
-            if (right == null) return left;
-
-            // Find rightmost node in left subtree
-            var current = left.?;
-            while (current.right) |r| {
-                current = r;
-            }
-            current.right = right;
-            return left;
         }
 
         /// Try to merge with the rightmost node in the left subtree if adjacent
@@ -779,23 +760,39 @@ pub fn Tree(comptime T: type) type {
 
         /// Create a new tree that is the intersection of this tree and another
         /// Caller owns the returned tree
-        /// This is O(k * m) where k and m are interval counts
+        /// This is O(k + m) where k and m are interval counts (merge-join algorithm)
         pub fn setIntersection(self: *const Self, other: *const Self, allocator: std.mem.Allocator) !Self {
             var result = Self.init(allocator);
             errdefer result.deinit();
 
-            // For each interval in self, find overlapping portions with intervals in other
+            // Use merge-join since both iterators yield intervals in sorted order
             var it = self.iterator();
-            while (it.next()) |interval| {
-                var other_it = other.iterator();
-                while (other_it.next()) |other_interval| {
-                    // Check for overlap
-                    if (interval.intersectsRange(other_interval.first, other_interval.last)) {
-                        // Compute the intersection
-                        const start = @max(interval.first, other_interval.first);
-                        const end = @min(interval.last, other_interval.last);
-                        try result.insertRange(start, end);
-                    }
+            var other_it = other.iterator();
+
+            var interval = it.next();
+            var other_interval = other_it.next();
+
+            while (interval != null and other_interval != null) {
+                const a = interval.?;
+                const b = other_interval.?;
+
+                // Check for overlap
+                if (a.intersectsRange(b.first, b.last)) {
+                    // Compute the intersection
+                    const start = @max(a.first, b.first);
+                    const end = @min(a.last, b.last);
+                    try result.insertRange(start, end);
+                }
+
+                // Advance the iterator whose interval ends first
+                if (a.last < b.last) {
+                    interval = it.next();
+                } else if (b.last < a.last) {
+                    other_interval = other_it.next();
+                } else {
+                    // Both end at the same point, advance both
+                    interval = it.next();
+                    other_interval = other_it.next();
                 }
             }
 
@@ -804,7 +801,7 @@ pub fn Tree(comptime T: type) type {
 
         /// Create a new tree that is this tree minus the other tree (difference)
         /// Caller owns the returned tree
-        /// This is O(k + m) where k and m are interval counts
+        /// This is O(k log k + m log n) where k and m are interval counts in self and other
         pub fn setDifference(self: *const Self, other: *const Self, allocator: std.mem.Allocator) !Self {
             var result = Self.init(allocator);
             errdefer result.deinit();
@@ -1569,6 +1566,20 @@ test "interval count" {
 
     const range = I.initRange(5, 10);
     try std.testing.expectEqual(@as(usize, 6), range.count());
+}
+
+test "interval count - full range signed (overflow protection)" {
+    // This test verifies the overflow fix: i8 range [-128, 127] has 256 elements
+    // The old implementation would overflow: 127 - (-128) = 255 which overflows i8
+    const I = Interval(i8);
+    const full_range = I.initRange(-128, 127);
+    try std.testing.expectEqual(@as(usize, 256), full_range.count());
+}
+
+test "interval count - full range unsigned" {
+    const I = Interval(u8);
+    const full_range = I.initRange(0, 255);
+    try std.testing.expectEqual(@as(usize, 256), full_range.count());
 }
 
 test "thread-safe delete" {
