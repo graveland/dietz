@@ -251,17 +251,34 @@ fn formatBytes(bytes: usize) struct { value: f64, unit: []const u8 } {
     }
 }
 
+fn formatOpsPerSec(ns: u64) struct { value: f64, unit: []const u8 } {
+    if (ns == 0) return .{ .value = 0, .unit = "ops/s" };
+    const ops_per_sec = 1_000_000_000.0 / @as(f64, @floatFromInt(ns));
+    if (ops_per_sec >= 1_000_000_000) {
+        return .{ .value = ops_per_sec / 1_000_000_000.0, .unit = "Gop/s" };
+    } else if (ops_per_sec >= 1_000_000) {
+        return .{ .value = ops_per_sec / 1_000_000.0, .unit = "Mop/s" };
+    } else if (ops_per_sec >= 1_000) {
+        return .{ .value = ops_per_sec / 1_000.0, .unit = "Kop/s" };
+    } else {
+        return .{ .value = ops_per_sec, .unit = "op/s" };
+    }
+}
+
 fn printTextResult(result: BenchmarkResult, buf: []u8) void {
     const m = formatNanos(result.stats.mean_ns);
     const s = formatNanos(result.stats.std_ns);
     const mem = formatBytes(result.memory.peak_bytes);
+    const ops = formatOpsPerSec(result.stats.mean_ns);
 
-    const line = std.fmt.bufPrint(buf, "  {s:<30} {d:>8.3} {s:<2}  ±{d:>6.3} {s:<2}  peak: {d:>6.1} {s}  ({d} allocs)\n", .{
+    const line = std.fmt.bufPrint(buf, "  {s:<28} {d:>7.3} {s:<2}  ±{d:>7.3} {s:<2}  {d:>7.2} {s:<5}  peak: {d:>6.1} {s:<2}  ({d} allocs)\n", .{
         result.name,
         m.value,
         m.unit,
         s.value,
         s.unit,
+        ops.value,
+        ops.unit,
         mem.value,
         mem.unit,
         result.memory.allocation_count,
@@ -1422,14 +1439,16 @@ const ConcurrentMixed90_10Ctx = struct {
 
 const OverheadCtx = struct {
     regular_tree: Tree(i64),
-    threadsafe_tree: ThreadSafeTree(i64),
+    threadsafe_tree: *ThreadSafeTree(i64),
     queries: []i64,
     allocator: std.mem.Allocator,
 
     fn setup(allocator: std.mem.Allocator, size: Size) !OverheadCtx {
         const count = size.elementCount();
         var regular = Tree(i64).init(allocator);
-        var threadsafe = ThreadSafeTree(i64).init(allocator);
+
+        const threadsafe = try allocator.create(ThreadSafeTree(i64));
+        threadsafe.* = ThreadSafeTree(i64).init(allocator);
 
         for (0..count) |i| {
             try regular.insert(@intCast(i));
@@ -1460,6 +1479,7 @@ const OverheadCtx = struct {
     fn teardown(ctx: *OverheadCtx) void {
         ctx.regular_tree.deinit();
         ctx.threadsafe_tree.deinit();
+        ctx.allocator.destroy(ctx.threadsafe_tree);
         ctx.allocator.free(ctx.queries);
     }
 };
@@ -1781,20 +1801,16 @@ pub fn main() !void {
                 if (config.format == .text) printTextResult(r, &buf);
             }
 
-            if (matchesFilter("overhead/single_thread", config.filter)) {
-                // Run both to compare
-                const baseline = try runBenchmark(OverheadBaselineCtx, "overhead/baseline", size, config, gpa, OverheadBaselineCtx.setup, OverheadBaselineCtx.run, OverheadBaselineCtx.teardown);
-                const threadsafe = try runBenchmark(OverheadCtx, "overhead/threadsafe", size, config, gpa, OverheadCtx.setup, OverheadCtx.run, OverheadCtx.teardown);
+            if (matchesFilter("overhead/baseline", config.filter)) {
+                const r = try runBenchmark(OverheadBaselineCtx, "overhead/baseline", size, config, gpa, OverheadBaselineCtx.setup, OverheadBaselineCtx.run, OverheadBaselineCtx.teardown);
+                try results.append(gpa, r);
+                if (config.format == .text) printTextResult(r, &buf);
+            }
 
-                try results.append(gpa, baseline);
-                try results.append(gpa, threadsafe);
-
-                if (config.format == .text) {
-                    printTextResult(baseline, &buf);
-                    printTextResult(threadsafe, &buf);
-                    const ratio = @as(f64, @floatFromInt(threadsafe.stats.mean_ns)) / @as(f64, @floatFromInt(baseline.stats.mean_ns));
-                    print(&buf, "  overhead ratio: {d:.2}x\n", .{ratio});
-                }
+            if (matchesFilter("overhead/threadsafe", config.filter)) {
+                const r = try runBenchmark(OverheadCtx, "overhead/threadsafe", size, config, gpa, OverheadCtx.setup, OverheadCtx.run, OverheadCtx.teardown);
+                try results.append(gpa, r);
+                if (config.format == .text) printTextResult(r, &buf);
             }
         }
 
