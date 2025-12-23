@@ -2,7 +2,7 @@
     .name = .dietz,
     .version = "0.1.0",
     .fingerprint = 0x5921b3028c715d3f, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0-dev.1316+181b25ce4",
+    .minimum_zig_version = "0.16.0-dev.1634+b27bdd5af",
     .dependencies = .{
     },
     .paths = .{
